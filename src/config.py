@@ -93,11 +93,11 @@ def get_config(parse=True, **optional_kwargs):
     parser.add_argument('--n_epoch', type=int, default=500)
     parser.add_argument('--patience', type=int, default=6)
 
-    parser.add_argument('--diff_weight', type=float, default=0.3)
+    parser.add_argument('--diff_weight', type=float, default=0.5)
     parser.add_argument('--sim_weight', type=float, default=1.0)
     parser.add_argument('--sp_weight', type=float, default=0.0)
     parser.add_argument('--recon_weight', type=float, default=1.0)
-    parser.add_argument('--semi_weight', type=float, default=0.5)  # 半公共空间损失权重
+    parser.add_argument('--semi_weight', type=float, default=0.1)  # 半公共空间损失权重
 
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--optimizer', type=str, default='Adam')
@@ -113,6 +113,14 @@ def get_config(parse=True, **optional_kwargs):
 
     # 新增Facet特征维度
     parser.add_argument('--facet_visual_size', type=int, default=47)
+
+    # 新增融合模块参数
+    parser.add_argument('--fusion_num_heads', type=int, default=16, 
+                       help='Number of attention heads in fusion modules')
+    parser.add_argument('--fusion_dropout', type=float, default=0.7,
+                       help='Dropout rate for fusion modules')
+    parser.add_argument('--use_residual_fusion', type=str2bool, default=True,
+                       help='Whether to use residual connections in fusion modules')
 
     # Model
     parser.add_argument('--model', type=str,
