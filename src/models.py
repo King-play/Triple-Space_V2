@@ -25,6 +25,110 @@ def masked_max(tensor, mask, dim):
     return (masked + neg_inf).max(dim=dim)
 
 
+class SelfAttention(nn.Module):
+    """Self-attention module for feature enhancement"""
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1):
+        super(SelfAttention, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, 
+            num_heads=num_heads, 
+            dropout=dropout,
+            batch_first=True
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # x shape: [batch_size, hidden_size]
+        # 为了使用 MultiheadAttention，需要添加序列维度
+        x_seq = x.unsqueeze(1)  # [batch_size, 1, hidden_size]
+        
+        attn_output, _ = self.multihead_attn(x_seq, x_seq, x_seq)
+        attn_output = attn_output.squeeze(1)  # [batch_size, hidden_size]
+        
+        # 残差连接和层归一化
+        output = self.layer_norm(x + self.dropout(attn_output))
+        return output
+
+
+class CrossSpaceAttention(nn.Module):
+    """Cross-space attention module"""
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1):
+        super(CrossSpaceAttention, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query_space, context):
+        # query_space: [batch_size, space_dim, hidden_size] - 某个空间的特征
+        # context: [batch_size, total_dim, hidden_size] - 所有空间拼接的特征
+        
+        attn_output, _ = self.multihead_attn(query_space, context, context)
+        
+        # 残差连接和层归一化
+        output = self.layer_norm(query_space + self.dropout(attn_output))
+        return output
+
+
+class GatedFusion(nn.Module):
+    """Gated fusion module for multi-space features"""
+    def __init__(self, hidden_size, num_spaces=3, dropout=0.1):
+        super(GatedFusion, self).__init__()
+        self.num_spaces = num_spaces
+        self.hidden_size = hidden_size
+        
+        # 门控网络：为每个空间学习权重
+        self.gate_networks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size // 2, 1)
+            ) for _ in range(num_spaces)
+        ])
+        
+        self.softmax = nn.Softmax(dim=1)
+        
+    def forward(self, space_features):
+        # space_features: list of [batch_size, space_dim, hidden_size]
+        # 每个元素代表一个空间的所有特征
+        
+        batch_size = space_features[0].size(0)
+        
+        # 计算每个空间的代表性特征（平均池化）
+        space_representations = []
+        for space_feat in space_features:
+            # space_feat: [batch_size, space_dim, hidden_size]
+            space_repr = torch.mean(space_feat, dim=1)  # [batch_size, hidden_size]
+            space_representations.append(space_repr)
+        
+        # 计算门控权重
+        gate_scores = []
+        for i, space_repr in enumerate(space_representations):
+            gate_score = self.gate_networks[i](space_repr)  # [batch_size, 1]
+            gate_scores.append(gate_score)
+        
+        gate_scores = torch.cat(gate_scores, dim=1)  # [batch_size, num_spaces]
+        gate_weights = self.softmax(gate_scores)  # [batch_size, num_spaces]
+        
+        # 加权融合
+        weighted_features = []
+        for i, space_feat in enumerate(space_features):
+            # space_feat: [batch_size, space_dim, hidden_size]
+            weight = gate_weights[:, i:i+1].unsqueeze(-1)  # [batch_size, 1, 1]
+            weighted_feat = space_feat * weight  # 广播乘法
+            weighted_features.append(weighted_feat)
+        
+        # 拼接所有加权特征
+        final_features = torch.cat(weighted_features, dim=1)  # [batch_size, total_dim, hidden_size]
+        
+        return final_features
+
 
 # let's define a simple model that can deal with multimodal variable length sequence
 class MISA(nn.Module):
@@ -36,7 +140,7 @@ class MISA(nn.Module):
         
         # 根据配置选择视觉特征处理方式
         if config.use_facet_visual:
-            self.visual_size = config.facet_visual_size  # 35维Facet特征
+            self.visual_size = config.facet_visual_size  # 47维Facet特征
         else:
             self.visual_size = config.visual_size  # 原始视觉特征
             
@@ -196,18 +300,48 @@ class MISA(nn.Module):
         self.semi_discriminator_va.add_module('semi_discriminator_va_activation', self.activation)
         self.semi_discriminator_va.add_module('semi_discriminator_va_2', nn.Linear(in_features=config.hidden_size, out_features=3))
 
-        # 融合层
-        self.fusion = nn.Sequential()
-        self.fusion.add_module('fusion_layer_1', nn.Linear(in_features=self.config.hidden_size*12, out_features=self.config.hidden_size*4))
-        self.fusion.add_module('fusion_layer_1_dropout', nn.Dropout(dropout_rate))
-        self.fusion.add_module('fusion_layer_1_activation', self.activation)
-        self.fusion.add_module('fusion_layer_3', nn.Linear(in_features=self.config.hidden_size*4, out_features= output_size))
+        ##########################################
+        # 新的融合模块
+        ##########################################
+        # 获取融合模块参数
+        fusion_num_heads = getattr(config, 'fusion_num_heads', 8)
+        fusion_dropout = getattr(config, 'fusion_dropout', 0.1)
+        use_residual = getattr(config, 'use_residual_fusion', True)
+        
+        # 自增强模块
+        self.self_attn_pub = SelfAttention(config.hidden_size, 
+                                          num_heads=fusion_num_heads, 
+                                          dropout=fusion_dropout)
+        self.self_attn_prv = SelfAttention(config.hidden_size, 
+                                          num_heads=fusion_num_heads, 
+                                          dropout=fusion_dropout)
+        self.self_attn_semi = SelfAttention(config.hidden_size, 
+                                           num_heads=fusion_num_heads, 
+                                           dropout=fusion_dropout)
+        
+        # 跨空间注意力模块
+        self.cross_attn_semi = CrossSpaceAttention(config.hidden_size, 
+                                                  num_heads=fusion_num_heads, 
+                                                  dropout=fusion_dropout)
+        self.cross_attn_prv = CrossSpaceAttention(config.hidden_size, 
+                                                 num_heads=fusion_num_heads, 
+                                                 dropout=fusion_dropout)
+        
+        # 门控融合模块
+        self.gated_fusion = GatedFusion(config.hidden_size, 
+                                       num_spaces=3, 
+                                       dropout=fusion_dropout)
+        
+        # 最终分类层
+        self.final_classifier = nn.Sequential(
+            nn.Linear(7 * config.hidden_size, config.hidden_size * 2),
+            self.activation,
+            nn.Dropout(dropout_rate),
+            nn.Linear(config.hidden_size * 2, output_size)
+        )
 
         self.tlayer_norm = nn.LayerNorm((hidden_sizes[0]*2,))
         self.alayer_norm = nn.LayerNorm((hidden_sizes[2]*2,))
-
-        encoder_layer = nn.TransformerEncoderLayer(d_model=self.config.hidden_size, nhead=2)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
 
         
     def extract_features(self, sequence, lengths, rnn1, rnn2, layer_norm):
@@ -256,9 +390,6 @@ class MISA(nn.Module):
         # 视觉特征处理：根据配置选择不同方式
         if self.config.use_facet_visual:
             # 使用Facet特征：需要正确处理维度
-            #print(f"Visual shape: {visual.shape}")  # 调试信息
-            #print(f"Lengths shape: {lengths.shape}")  # 调试信息
-
             if len(visual.shape) == 3:
                 # visual shape: [seq_len, batch_size, feature_dim] 或 [batch_size, seq_len, feature_dim]
                 # 需要确定visual的维度顺序
@@ -354,18 +485,86 @@ class MISA(nn.Module):
         # For reconstruction
         self.reconstruct()
         
-        # Transformer融合
-        h = torch.stack((
-            self.utt_private_t, self.utt_private_v, self.utt_private_a,
-            self.utt_semi_shared_tv_t, self.utt_semi_shared_tv_v,
-            self.utt_semi_shared_ta_t, self.utt_semi_shared_ta_a,
-            self.utt_semi_shared_va_v, self.utt_semi_shared_va_a,
-            self.utt_shared_t, self.utt_shared_v, self.utt_shared_a
-        ), dim=0)
-        h = self.transformer_encoder(h)
-        h = torch.cat((h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11]), dim=1)
-        o = self.fusion(h)
+        # 新的融合策略
+        o = self.advanced_fusion()
         return o
+    
+    def advanced_fusion(self):
+        """新的多阶段融合策略"""
+        batch_size = self.utt_private_t.size(0)
+        
+        # 阶段1: 准备三个空间的特征
+        # Public space features (全共享空间)
+        pub_features = torch.stack([
+            self.utt_shared_t, 
+            self.utt_shared_v, 
+            self.utt_shared_a
+        ], dim=1)  # [batch_size, 3, hidden_size]
+        
+        # Private space features (私有空间)
+        prv_features = torch.stack([
+            self.utt_private_t,
+            self.utt_private_v, 
+            self.utt_private_a
+        ], dim=1)  # [batch_size, 3, hidden_size]
+        
+        # Semi-shared space features (半共享空间)
+        semi_features = torch.stack([
+            self.utt_semi_shared_tv_t,
+            self.utt_semi_shared_tv_v,
+            self.utt_semi_shared_ta_t, 
+            self.utt_semi_shared_ta_a,
+            self.utt_semi_shared_va_v,
+            self.utt_semi_shared_va_a
+        ], dim=1)  # [batch_size, 6, hidden_size]
+        
+        # 阶段2: 自增强 (Self-Enhancement)
+        # 对每个空间内的特征进行自注意力增强
+        pub_enhanced = []
+        for i in range(pub_features.size(1)):
+            enhanced = self.self_attn_pub(pub_features[:, i, :])
+            pub_enhanced.append(enhanced)
+        pub_enhanced = torch.stack(pub_enhanced, dim=1)  # [batch_size, 3, hidden_size]
+        
+        prv_enhanced = []
+        for i in range(prv_features.size(1)):
+            enhanced = self.self_attn_prv(prv_features[:, i, :])
+            prv_enhanced.append(enhanced)
+        prv_enhanced = torch.stack(prv_enhanced, dim=1)  # [batch_size, 3, hidden_size]
+        
+        semi_enhanced = []
+        for i in range(semi_features.size(1)):
+            enhanced = self.self_attn_semi(semi_features[:, i, :])
+            semi_enhanced.append(enhanced)
+        semi_enhanced = torch.stack(semi_enhanced, dim=1)  # [batch_size, 6, hidden_size]
+        
+        # 阶段3: 跨空间注意力 (Cross-Space Attention)
+        # 拼接所有增强后的特征作为上下文
+        all_context = torch.cat([pub_enhanced, prv_enhanced, semi_enhanced], dim=1)  # [batch_size, 12, hidden_size]
+        
+        # 对半共享和私有空间进行跨空间注意力
+        semi_cross_attended = self.cross_attn_semi(semi_enhanced, all_context)  # [batch_size, 6, hidden_size]
+        prv_cross_attended = self.cross_attn_prv(prv_enhanced, all_context)    # [batch_size, 3, hidden_size]
+        
+        # 阶段4: 门控融合 (Gated Fusion)
+        space_features = [pub_enhanced, semi_cross_attended, prv_cross_attended]
+        gated_features = self.gated_fusion(space_features)  # [batch_size, 12, hidden_size]
+        
+        # 阶段5: 最终分类
+        # 根据你的设计，需要7个特征向量进行最终融合
+        # 重新组织特征以得到7个向量
+        final_seven_features = torch.cat([
+            pub_enhanced.mean(dim=1),           # 1. 公共空间平均
+            semi_cross_attended[:, 0, :],       # 2. TV半共享 - T
+            semi_cross_attended[:, 1, :],       # 3. TV半共享 - V  
+            semi_cross_attended[:, 2, :],       # 4. TA半共享 - T
+            semi_cross_attended[:, 3, :],       # 5. TA半共享 - A
+            semi_cross_attended[:, 4, :],       # 6. VA半共享 - V
+            prv_cross_attended.mean(dim=1)      # 7. 私有空间平均
+        ], dim=1)  # [batch_size, 7*hidden_size]
+        
+        output = self.final_classifier(final_seven_features)
+        return output
     
     def reconstruct(self,):
         self.utt_t = (self.utt_private_t + self.utt_semi_shared_tv_t + self.utt_semi_shared_ta_t + self.utt_shared_t)
