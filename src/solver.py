@@ -138,7 +138,7 @@ class Solver(object):
                     self.train_config.diff_weight * diff_loss + \
                     self.train_config.sim_weight * similarity_loss + \
                     self.train_config.recon_weight * recon_loss + \
-                    self.train_config.sim_weight * semi_domain_loss  # 新增半公共域损失
+                    self.train_config.semi_weight * semi_domain_loss  # 新增半公共域损失
 
                 loss.backward()
                 
